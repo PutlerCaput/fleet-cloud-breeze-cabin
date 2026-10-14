@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --color-bg: #101210;
+  --color-surface: #181b18;
+  --color-raised: #21251f;
+  --color-fg: #e8ebe4;
+  --color-muted: #8d9488;
+  --color-line: #2e342c;
+  --color-accent: #d6a24a;
+  --color-accent-fg: #1c1508;
+  --color-up: #8fbf78;
+  --color-down: #d47868;
+  --radius-md: 0.75rem;
+}
+
+@layer base {
+  html,
+  body {
+    background:
+      radial-gradient(900px 420px at 0% -10%, rgba(214, 162, 74, 0.16), transparent 55%),
+      radial-gradient(700px 380px at 100% 0%, rgba(143, 191, 120, 0.08), transparent 46%),
+      linear-gradient(180deg, #161a16 0%, var(--color-bg) 280px);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    min-height: 100%;
+  }
+
+  ::selection {
+    background: rgba(214, 162, 74, 0.35);
+    color: #fff8ea;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  input {
+    font-family: var(--font-mono);
+  }
+
+  input:focus {
+    border-color: var(--color-accent);
+    box-shadow: 0 0 0 3px rgba(214, 162, 74, 0.16);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

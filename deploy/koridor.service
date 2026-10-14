@@ -1,0 +1,16 @@
+[Unit]
+Description=Koridor grid
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/koridor
+Environment=NODE_ENV=development
+EnvironmentFile=-/opt/koridor/.env
+ExecStart=/usr/bin/npm run dev
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
