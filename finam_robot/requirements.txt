@@ -1,0 +1,8 @@
+numpy>=1.26
+numba>=0.59
+scikit-learn>=1.4
+httpx[http2]>=0.27
+# опционально:
+# uvloop>=0.19          # быстрее event loop на Linux
+# grpcio>=1.62          # BOOK_SOURCE=grpc (+ классы из proto Finam)
+# pytest>=8             # тесты

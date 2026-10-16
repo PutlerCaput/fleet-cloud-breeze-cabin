@@ -1,0 +1,20 @@
+[Unit]
+Description=Finam FORTS contest robot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=contest_robot
+WorkingDirectory=/home/contest_robot/app
+EnvironmentFile=/home/contest_robot/robot.env
+ExecStart=/home/contest_robot/venv/bin/python -m finam_robot
+# SIGTERM: робот закрывает позицию и сессию; даём на это время
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=always
+RestartSec=5
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
