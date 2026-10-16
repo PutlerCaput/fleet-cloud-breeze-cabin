@@ -26,6 +26,7 @@ from .config import TZ_MOSCOW, Settings, risk_to_array
 from .execution import ExecReport, ExecutionEngine, OrderIntent
 from .ml import MarketMlOptimizer, load_weights, save_session, save_weights
 from .pipeline import ConflatingConsumer, SnapshotRing
+from .recorder import BookRecorder
 from .sources import LEVELS, ROWS_SNAPSHOT
 
 logger = logging.getLogger("ContestRobot")
@@ -79,6 +80,7 @@ class InstitutionalContestRobot:
         self._exec: ExecutionEngine | None = None
         self._account = None
         self._consumer: ConflatingConsumer | None = None
+        self.book_recorder: BookRecorder | None = None
         self._flat_event: asyncio.Event | None = None
         self._pending_since = 0.0
         self._signal_p = 0.5
@@ -137,6 +139,8 @@ class InstitutionalContestRobot:
             self.gc_monitor.reset()
         for g in ("infra", "time", "loss", "target"):
             self.set_gate(g, True)
+        if s.record_books:
+            self.book_recorder = BookRecorder(os.path.join(s.data_dir, "books"), s.book_depth)
         try:
             self._account = await self.account_factory()
             if self.md_gateway is not None and os.getenv("RISK_TICK") is None:
@@ -198,6 +202,12 @@ class InstitutionalContestRobot:
                                            self.feature_dir, datetime.now(TZ_MOSCOW))
         except Exception as e:
             logger.error("[ML] признаки сессии не сохранены: %r", e)
+        if self.book_recorder is not None:
+            try:
+                await self.book_recorder.close()
+            except Exception as e:
+                logger.error("[REC] стакан не сохранён: %r", e)
+            self.book_recorder = None
         await self._close_account()
 
         lines = [
@@ -288,6 +298,8 @@ class InstitutionalContestRobot:
             asm.write(ring.mv, base, ring.depth)
         ring.publish(idx, asm.nb, asm.na, time.time())
         self._last_md = time.monotonic()
+        if self.book_recorder is not None:
+            self.book_recorder.push(ring, idx)
         if self._inline:
             self._process(idx)
         else:

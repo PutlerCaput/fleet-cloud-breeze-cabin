@@ -10,7 +10,8 @@ python -m finam_robot                       # production: Moscow-time schedule, 
 python -m finam_robot --now --duration 60   # open a session now, stop after 60 s
 python -m finam_robot --train               # run the weekly ML job once
 python -m finam_robot.bench                 # hot-path benchmark
-python -m pytest finam_robot/tests -q       # 34 tests
+python -m finam_robot.backtest --fetch CRZ6 # backtest on today's MOEX tape
+python -m pytest finam_robot/tests -q       # 42 tests
 ```
 
 Safe default: `DRY_RUN=1` uses a paper broker. `BOOK_SOURCE=synthetic DRY_RUN=1` runs the whole
@@ -172,6 +173,56 @@ order, plus a persistent HTTP/2 connection: a TLS handshake costs tens of ms, th
 0.1 ms. If you ever need isolation, use a separate **process**. `EXEC_THREADED=1` is kept for
 free-threaded Python builds.
 
+## Backtest (`backtest.py`)
+
+The backtest replays a tape through the **same** `kernels.on_tick` the robot runs live. The tape
+array is read by index, exactly like the ring buffer. The execution model mirrors the live path:
+
+- orders reach the exchange after `latency` and fill against the book at that moment as IOC limits;
+- when book depth is known, large orders walk the levels;
+- exits retry at a fresh price until the position is flat;
+- per-lot fees, sizing (`equity × 0.95 // margin`), clearing windows, the daily loss stop and the
+  end-of-session flatten all match the robot.
+
+```
+python -m finam_robot.backtest --fetch CRZ6                    # today's MOEX ISS tape (free, current session only)
+python -m finam_robot.backtest --books "/home/contest_robot/books/books_*.npz"   # real recorded book
+```
+
+Outputs `backtest_report.json`, `trades_dynamic.csv` and `trades_static.csv`. The report includes:
+
+- the new risk engine against the old static 5 / 15 / 10 stops;
+- a latency × fee grid and a signal-threshold sweep;
+- a **null test**: the same prices with order flow shuffled in one-minute blocks;
+- a bootstrap of trades;
+- an ML walk-forward: train on the first half of the session, test on the second.
+
+**Data limits.** Without a subscription, MOEX ISS gives tick trades for the current session only,
+and no order book. A trades-only tape becomes a proxy book: bid and ask are the last sell- and
+buy-aggressor prices, and the "volumes" are decayed aggressive buy and sell flow. The signal is
+then trade-flow imbalance, which is close to book imbalance but not the same. For a real
+multi-week backtest, run the robot with `RECORD_BOOKS=1` (dry run is fine). `recorder.py` writes
+every book snapshot to `data_dir/books/*.npz` off the hot path, and `--books` replays those files.
+
+**Result for 16.10.2026** (CRZ6, 246,837 trades; robot active 09:55–21:40 MSK; 30 ms latency;
+1 RUB/lot/side fee assumed; margin 1,232.71 RUB per lot from ISS):
+
+| | new risk engine | old 5/15/10 stops |
+|---|---|---|
+| return | −10.13 % (hit the daily stop at 18:33) | −6.55 % |
+| trades / win rate | 60 / 42 % | 29 / 34 % |
+| P&L before fees / fees | −373 / 2,666 RUB | −705 / 1,260 RUB |
+
+- **No edge:** shuffled order flow did as well or better in 73 % of 60 runs (mean −8.7 %).
+- **Even with zero fees** the day is −1.9 %.
+- **Strict thresholds hurt:** raising the entry threshold makes P&L before fees *worse*.
+- **The ML model predicts but doesn't pay:** it picks the 5-second direction 82 % of the time
+  (walk-forward), yet loses out of sample, because the moves it predicts are smaller than the
+  spread plus fees.
+- **Break-even math:** each round trip costs about 2 ticks per lot in fees plus the spread. Hitting
+  +3 %/day at this trade count needs about +2.6 ticks per lot per trade before fees; the day
+  produced −0.27.
+
 ## Layout
 
 | file | role |
@@ -183,6 +234,7 @@ free-threaded Python builds.
 | `gateway.py` | `FinamRestGateway` (persistent HTTP/2, JWT refresh, IOC limits, reconcile), `PaperBroker` / `PaperGateway` |
 | `execution.py` | `ExecutionEngine`: target-position coalescing, token bucket, reconcile before retry |
 | `robot.py` | `InstitutionalContestRobot`: hot path, entry gates, sizing, daily limits, session start/stop |
+| `backtest.py`, `moex_iss.py`, `recorder.py` | event-driven backtest on the live kernel, MOEX ISS tape loader, real order-book recorder |
 | `watchdog.py`, `notify.py`, `ml.py`, `scheduler.py`, `runtime.py` | infrastructure |
 
 ## Configuration (env)
@@ -201,6 +253,7 @@ free-threaded Python builds.
 | `STOP_AFTER_TARGET` | `0` | stop entering after +`DAILY_TARGET_PCT` |
 | `NO_ENTRY_WINDOWS` | `13:58-14:06,18:43-19:06,23:30-23:59` | clearing sessions and the last minutes before the forced close |
 | `EXEC_THREADED` | `0` | see item 4 |
+| `RECORD_BOOKS` | `0` | record every order-book snapshot for `backtest --books` |
 | `RISK_<NAME>` | see `config.RiskParams` | any risk-engine parameter, e.g. `RISK_K_VOL=2.0` |
 
 To keep using your own SDK stream, pass

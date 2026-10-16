@@ -110,6 +110,7 @@ class Settings:
     book_depth: int = 3                       # уровней в буфере (= levels сигнала; +0.4 мкс/уровень)
     ring_capacity: int = 256                  # снимков в кольцевом буфере (степень двойки)
     inline_consumer: bool = True              # считать сигнал прямо в продюсере
+    record_books: bool = False                # писать стакан для бэктеста (data_dir/books)
 
     dry_run: bool = True                      # бумажный исполнитель вместо боевого
     exec_threaded: bool = False               # True — отдельный поток (см. README: GIL!)
@@ -155,6 +156,7 @@ class Settings:
             book_depth=_env_int("BOOK_DEPTH", 3),
             ring_capacity=_env_int("RING_CAPACITY", 256),
             inline_consumer=_env_bool("INLINE_CONSUMER", True),
+            record_books=_env_bool("RECORD_BOOKS", False),
             dry_run=_env_bool("DRY_RUN", True),
             exec_threaded=_env_bool("EXEC_THREADED", False),
             max_orders_per_sec=_env_float("MAX_ORDERS_PER_SEC", 5.0),

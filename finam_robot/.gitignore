@@ -2,3 +2,4 @@ __pycache__/
 *.nbi
 *.nbc
 .pytest_cache/
+backtest_out/
