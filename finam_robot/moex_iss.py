@@ -105,3 +105,89 @@ def load_trades(path: str):
             ts[i:j] = secs[i] + np.arange(k) / k
         i = j
     return ts, price, qty, side, tradeno
+
+
+# --- минутные свечи для исследования стратегий -----------------------------
+
+# Квартальные фьючерсы CNY/RUB и даты экспирации (последний торговый день, ISS).
+CR_CONTRACTS = (
+    ("CRZ4", "2024-12-19"), ("CRH5", "2025-03-20"), ("CRM5", "2025-06-19"), ("CRU5", "2025-09-18"),
+    ("CRZ5", "2025-12-18"), ("CRH6", "2026-03-19"), ("CRM6", "2026-06-18"), ("CRU6", "2026-09-17"),
+    ("CRZ6", "2026-12-17"),
+)
+
+
+def fetch_candles(secid: str, date_from: str, date_till: str, interval: int = 1, page: int = 500) -> list[list]:
+    """Свечи ISS [begin, open, high, low, close, volume] за период (включительно), постранично."""
+    out: list[list] = []
+    start = 0
+    with httpx.Client(timeout=60) as http:
+        while True:
+            for attempt in range(5):
+                try:
+                    r = http.get(f"{ISS}/{secid}/candles.json", params={
+                        "iss.meta": "off", "iss.only": "candles", "interval": interval,
+                        "from": date_from, "till": date_till, "start": start})
+                    r.raise_for_status()
+                    break
+                except httpx.HTTPError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(2 ** attempt)
+            c = r.json()["candles"]
+            idx = {k: i for i, k in enumerate(c["columns"])}
+            chunk = c["data"]
+            if not chunk:
+                return out
+            out.extend([row[idx["begin"]], row[idx["open"]], row[idx["high"]], row[idx["low"]],
+                        row[idx["close"]], row[idx["volume"]]] for row in chunk)
+            start += len(chunk)
+            if len(chunk) < page:
+                return out
+
+
+def build_front_month(cache_dir: str, contracts=CR_CONTRACTS, start: str = "2024-09-15",
+                      end: str | None = None, workers: int = 4) -> str:
+    """Непрерывный ряд 1m по ближайшему контракту -> cache_dir/cr_front_1m.csv.gz.
+
+    Ролловер по объёму: со дня, когда дневной объём следующего контракта
+    впервые больше текущего (обратно не переключаемся). Колонка secid
+    показывает, какой контракт в строке; позиции через ночь роботу не нужны,
+    поэтому склейка цен не требуется.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import date, timedelta
+
+    import pandas as pd
+
+    end = end or datetime.now(TZ_MOSCOW).strftime("%Y-%m-%d")
+    jobs = []
+    prev_exp = start
+    for secid, exp in contracts:
+        a = max(start, (date.fromisoformat(prev_exp) - timedelta(days=21)).isoformat())
+        b = min(end, exp)
+        if a <= b:
+            jobs.append((secid, a, b))
+        prev_exp = exp
+    with ThreadPoolExecutor(workers) as pool:
+        parts = list(pool.map(lambda j: (j[0], fetch_candles(j[0], j[1], j[2])), jobs))
+    frames = []
+    for secid, rows in parts:
+        df = pd.DataFrame(rows, columns=["begin", "open", "high", "low", "close", "volume"])
+        df["secid"] = secid
+        frames.append(df)
+    allc = pd.concat(frames, ignore_index=True)
+    allc["day"] = allc["begin"].str.slice(0, 10)
+    vol = allc.groupby(["day", "secid"])["volume"].sum().unstack(fill_value=0)
+    order = [c for c, _ in contracts if c in vol.columns]
+    cur = 0
+    chosen = {}
+    for day in sorted(vol.index):
+        while cur + 1 < len(order) and vol.at[day, order[cur + 1]] > vol.at[day, order[cur]]:
+            cur += 1
+        chosen[day] = order[cur]
+    front = allc[allc["secid"] == allc["day"].map(chosen)].sort_values("begin")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, "cr_front_1m.csv.gz")
+    front.drop(columns=["day"]).to_csv(path, index=False)
+    return path
