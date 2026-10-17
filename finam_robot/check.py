@@ -1,7 +1,9 @@
 """Проверка подключения к Finam Trade API: `python -m finam_robot.check`.
 
-Токен берётся только из переменной окружения FINAM_API_TOKEN (не из
-аргументов: так он не попадает в историю shell). Только чтение: токен,
+Токен берётся только из переменной окружения FINAM_API_TOKEN, не из
+аргументов командной строки: аргументы видны другим пользователям в списке
+процессов (ps). Задавайте его через EnvironmentFile/.env с правами 600,
+а не через `export` в интерактивном shell. Только чтение: токен,
 счета, права на маркет-дату, инструмент, шаг цены, ГО, стакан, время
 сервера. Заявок не выставляет.
 """
@@ -13,7 +15,25 @@ import asyncio
 import os
 import sys
 
-from .gateway import FinamAuthError, FinamRestGateway, dec, money
+import httpx
+
+from .gateway import FinamAuthError, FinamRestGateway, FinamUnavailableError, dec, money
+
+_QUOTE_RANK = {"QUOTE_LEVEL_LAST_PRICE": 1, "QUOTE_LEVEL_BEST_BID_OFFER": 2, "QUOTE_LEVEL_DEPTH_OF_MARKET": 3,
+               "QUOTE_LEVEL_DEPTH_OF_BOOK": 3, "QUOTE_LEVEL_ACCESS_FORBIDDEN": -1}
+
+
+def best_md_permission(perms: list, mic: str) -> dict | None:
+    """Права на площадку: сначала строки именно этой MIC, иначе — широкие
+    (worldwide / country / continent). Из выбранных — с минимальной задержкой
+    и самым подробным уровнем котировок."""
+    exact = [p for p in perms if mic and p.get("mic") == mic]
+    pool = exact or [p for p in perms if p.get("worldwide") or p.get("country") or p.get("continent")
+                     or (not mic and p.get("mic"))]
+    if not pool:
+        return None
+    return min(pool, key=lambda p: (int(p.get("delay_minutes") or 0),
+                                    -_QUOTE_RANK.get(str(p.get("quote_level", "")), 0)))
 
 OK, WARN, FAIL = "✅", "⚠️", "⛔"
 
@@ -38,6 +58,9 @@ async def run_check(secret: str, symbol: str, account_id: str = "", *, transport
             note(FAIL, f"{e}. Токен истёк, отозван или скопирован не полностью: "
                        "создайте новый на портале Finam Trade API.")
             return worst
+        except (FinamUnavailableError, httpx.TransportError) as e:
+            note(FAIL, f"Finam API или сеть недоступны ({e}). Токен не проверен — повторите позже.")
+            return worst
         note(OK, "API-токен принят, JWT получен")
 
         details = await gw.token_details()
@@ -55,21 +78,20 @@ async def run_check(secret: str, symbol: str, account_id: str = "", *, transport
             note(FAIL, f"FINAM_ACCOUNT_ID={account_id} нет в токене; доступны: {', '.join(ids)}")
             return worst
         gw.account_id = account_id or ids[0]
-        hint = "" if account_id else f" (FINAM_ACCOUNT_ID не задан; в токене: {', '.join(ids)})"
-        note(OK, f"счёт {gw.account_id}{hint}")
+        if account_id:
+            note(OK, f"счёт {gw.account_id}")
+        else:
+            note(WARN, f"FINAM_ACCOUNT_ID не задан, без него робот не стартует: "
+                       f"задайте FINAM_ACCOUNT_ID={ids[0]} (в токене: {', '.join(ids)})")
 
         mic = symbol.split("@")[-1] if "@" in symbol else ""
-        perms = details.get("md_permissions", [])
-        mine = [p for p in perms if not mic or p.get("mic") == mic or p.get("worldwide")]
-        if not mine:
+        perm = best_md_permission(details.get("md_permissions", []), mic)
+        if perm is None or _QUOTE_RANK.get(str(perm.get("quote_level", "")), 0) < 0:
             note(WARN, f"в токене нет прав на маркет-дату площадки {mic or symbol}: стакан может не отдаваться")
+        elif int(perm.get("delay_minutes") or 0) > 0:
+            note(WARN, f"маркет-дата {mic} с задержкой {perm.get('delay_minutes')} мин — для торговли непригодно")
         else:
-            delayed = [p for p in mine if int(p.get("delay_minutes") or 0) > 0]
-            if delayed:
-                note(WARN, f"маркет-дата {mic} с задержкой {delayed[0].get('delay_minutes')} мин — для HFT непригодно")
-            else:
-                level = mine[0].get("quote_level", "?")
-                note(OK, f"маркет-дата {mic or 'площадки'} в реальном времени, уровень {level}")
+            note(OK, f"маркет-дата {mic or 'площадки'} в реальном времени, уровень {perm.get('quote_level', '?')}")
 
         acc = await gw.get_account()
         out(f"   тип счёта {acc.get('type', '?')}, статус {acc.get('status', '?')}, "
@@ -78,7 +100,8 @@ async def run_check(secret: str, symbol: str, account_id: str = "", *, transport
         try:
             asset = await gw.get_asset_info(symbol)
         except RuntimeError as e:
-            note(FAIL, f"инструмент {symbol} не найден ({e}); проверьте FINAM_SYMBOL")
+            hint = "; проверьте FINAM_SYMBOL" if " 404 " in f" {e} " or "not found" in str(e).lower() else ""
+            note(FAIL, f"инструмент {symbol} недоступен ({e}){hint}")
             return worst
         note(OK, f"{symbol}: шаг цены {asset.tick:g}, знаков {asset.decimals}, лот {asset.lot_size:g}")
 

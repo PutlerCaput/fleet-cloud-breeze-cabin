@@ -17,7 +17,7 @@ from datetime import datetime, time
 
 from . import kernels
 from .config import TZ_MOSCOW, Settings
-from .gateway import AssetInfo, FinamAuthError, FinamRestGateway, PaperBroker, PaperGateway
+from .gateway import AssetInfo, FinamAuthError, FinamRestGateway, FinamUnavailableError, PaperBroker, PaperGateway
 from .notify import TelegramNotifier
 from .robot import InstitutionalContestRobot
 from .runtime import GcMonitor, setup_logging, tune_runtime
@@ -93,6 +93,9 @@ async def main(args) -> None:
         except FinamAuthError as e:
             logger.critical("%s. Проверьте токен: python -m finam_robot.check", e)
             raise SystemExit(2) from None
+        except FinamUnavailableError as e:
+            logger.critical("%s. systemd перезапустит робота.", e)
+            raise SystemExit(75) from None  # EX_TEMPFAIL
 
         if args.train:
             await robot.weekly_learning_job()

@@ -9,13 +9,15 @@ from finam_robot.gateway import FinamRestGateway
 JWT = "eyJ.test.jwt"
 
 
-def finam_mock(*, token_ok=True, delay=0, readonly=False, accounts=("1899011",)):
+def finam_mock(*, token_ok=True, delay=0, readonly=False, accounts=("1899011",), login_status=200, perms=None):
     seen = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path.removeprefix("/v1")
         seen.append((request.method, path, request.headers.get("Authorization")))
         if path == "/sessions":
+            if login_status != 200:
+                return httpx.Response(login_status, json={"code": 14, "message": "upstream unavailable"})
             if not token_ok:
                 return httpx.Response(401, json={"code": 16, "message": "Api token could not be verified",
                                                  "details": []})
@@ -25,7 +27,8 @@ def finam_mock(*, token_ok=True, delay=0, readonly=False, accounts=("1899011",))
         if path == "/sessions/details":
             return httpx.Response(200, json={
                 "created_at": "2026-10-17T08:00:00Z", "expires_at": "2026-10-17T08:15:00Z",
-                "md_permissions": [{"quote_level": "QUOTE_LEVEL_DEPTH_OF_BOOK", "delay_minutes": delay, "mic": "RTSX"}],
+                "md_permissions": perms if perms is not None else [
+                    {"quote_level": "QUOTE_LEVEL_DEPTH_OF_BOOK", "delay_minutes": delay, "mic": "RTSX"}],
                 "account_ids": list(accounts), "readonly": readonly})
         if path == "/assets/clock":
             return httpx.Response(200, json={"timestamp": "2026-10-17T08:00:01Z"})
@@ -50,9 +53,10 @@ def finam_mock(*, token_ok=True, delay=0, readonly=False, accounts=("1899011",))
 
 
 def check(**kw):
-    transport, seen = finam_mock(**{k: v for k, v in kw.items() if k in ("token_ok", "delay", "readonly", "accounts")})
+    keys = ("token_ok", "delay", "readonly", "accounts", "login_status", "perms")
+    transport, seen = finam_mock(**{k: v for k, v in kw.items() if k in keys})
     lines = []
-    code = asyncio.run(run_check("sk_test", "CRZ6@RTSX", kw.get("account_id", ""),
+    code = asyncio.run(run_check("sk_test", "CRZ6@RTSX", kw.get("account_id", "1899011"),
                                  transport=transport, out=lines.append))
     return code, "\n".join(lines), seen
 
@@ -74,6 +78,31 @@ def test_delayed_market_data_and_readonly_are_warnings():
     code, text, _ = check(delay=15, readonly=True)
     assert code == 1
     assert "задержкой 15" in text and "только для чтения" in text
+
+
+def test_transient_login_error_is_not_blamed_on_token():
+    for status in (429, 502, 503):
+        code, text, _ = check(login_status=status)
+        assert code == 2 and "недоступны" in text and "создайте новый" not in text, text
+
+
+def test_exact_mic_permission_wins_over_delayed_worldwide():
+    perms = [{"worldwide": True, "delay_minutes": 15, "quote_level": "QUOTE_LEVEL_LAST_PRICE"},
+             {"mic": "RTSX", "delay_minutes": 0, "quote_level": "QUOTE_LEVEL_DEPTH_OF_BOOK"}]
+    code, text, _ = check(perms=perms)
+    assert code == 0 and "QUOTE_LEVEL_DEPTH_OF_BOOK" in text and "задержкой" not in text, text
+
+
+def test_country_scoped_permission_counts_and_forbidden_warns():
+    code, text, _ = check(perms=[{"country": "RU", "delay_minutes": 0, "quote_level": "QUOTE_LEVEL_DEPTH_OF_MARKET"}])
+    assert code == 0, text
+    code, text, _ = check(perms=[{"mic": "RTSX", "delay_minutes": 0, "quote_level": "QUOTE_LEVEL_ACCESS_FORBIDDEN"}])
+    assert code == 1 and "нет прав" in text
+
+
+def test_missing_account_id_warns_with_the_value_to_set():
+    code, text, _ = check(account_id="")
+    assert code == 1 and "FINAM_ACCOUNT_ID=1899011" in text
 
 
 def test_unknown_account_id_fails():

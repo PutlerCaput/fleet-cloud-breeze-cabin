@@ -82,12 +82,33 @@ class FinamAuthError(RuntimeError):
     """API-токен не принят (истёк, отозван, скопирован не полностью)."""
 
 
+class FinamUnavailableError(RuntimeError):
+    """Finam или сеть временно недоступны (429, 5xx): токен тут ни при чём, повторить позже."""
+
+
+# gRPC-коды в теле ответа: 3 INVALID_ARGUMENT, 7 PERMISSION_DENIED, 16 UNAUTHENTICATED
+_AUTH_GRPC_CODES = {3, 7, 16}
+
+
 def finam_error_text(r: httpx.Response) -> str:
     try:
         body = r.json()
-        return f"{r.status_code} {body.get('message') or body}"
     except ValueError:
         return f"{r.status_code} {r.text[:200]}"
+    msg = body.get("message") if isinstance(body, dict) else None
+    return f"{r.status_code} {msg or str(body)[:200]}"
+
+
+def is_auth_rejection(r: httpx.Response) -> bool:
+    if r.status_code in (401, 403):
+        return True
+    if r.status_code == 400:
+        try:
+            body = r.json()
+        except ValueError:
+            return False
+        return isinstance(body, dict) and body.get("code") in _AUTH_GRPC_CODES
+    return False
 
 
 class FinamRestGateway:
@@ -128,7 +149,9 @@ class FinamRestGateway:
                 return
             r = await self._http.post("/sessions", json={"secret": self._secret})
             if r.status_code != 200:
-                raise FinamAuthError(f"Finam не принял API-токен: {finam_error_text(r)}")
+                if is_auth_rejection(r):
+                    raise FinamAuthError(f"Finam не принял API-токен: {finam_error_text(r)}")
+                raise FinamUnavailableError(f"Finam временно недоступен при входе: {finam_error_text(r)}")
             self._http.headers["Authorization"] = r.json()["token"]
             self._jwt_at = time.monotonic()
 

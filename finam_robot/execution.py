@@ -189,7 +189,10 @@ class ExecutionEngine:
                 await self._doorbell.wait()
                 if self._sync_requested:
                     self._sync_requested = False
-                    await self._sync()
+                    try:
+                        await self._sync()
+                    except Exception as e:  # сбой сверки не должен убивать поток заявок
+                        logger.error("[EXEC] сверка позиции не удалась: %r", e)
                 intent = self._pending
                 self._pending = None
                 if intent is not None:

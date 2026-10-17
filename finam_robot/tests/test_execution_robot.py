@@ -76,6 +76,25 @@ def test_urgent_exit_reconciles_after_failure(threaded):
     assert done[-1].position == 0 and "ConnectionError" in done[-1].error
 
 
+def test_failed_requested_sync_does_not_kill_executor():
+    async def scenario(eng):
+        real = eng._gw.get_position
+
+        async def boom(symbol):
+            raise ConnectionError("sync down")
+
+        eng._gw.get_position = boom
+        eng.request_sync()
+        await asyncio.sleep(0.05)
+        eng._gw.get_position = real
+        assert eng.alive()
+        eng.submit(intent(2))
+        await asyncio.sleep(0.2)
+
+    broker, eng, reports = asyncio.run(run_engine(scenario, threaded=False))
+    assert broker.position == 2
+
+
 def test_ioc_limit_that_misses_reports_zero_fill():
     async def scenario(eng):
         eng.submit(intent(2, limit=11.490))  # ниже ask -> IOC не исполняется
