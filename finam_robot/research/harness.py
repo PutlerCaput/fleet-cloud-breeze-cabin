@@ -47,6 +47,10 @@ class Session:
     no_entry: tuple = ((13 * 60 + 58, 14 * 60 + 6), (18 * 60 + 43, 19 * 60 + 6))
 
 
+DEFAULT_COSTS = Costs()
+DEFAULT_SESSION = Session()
+
+
 def load_bars(path: str) -> pd.DataFrame:
     """CSV ISS (begin, open, high, low, close, volume, secid) -> свечи будних дней."""
     df = pd.read_csv(path)
@@ -164,7 +168,7 @@ class Result:
         }
 
 
-def simulate(bars: pd.DataFrame, target, costs: Costs = Costs(), session: Session = Session()) -> Result:
+def simulate(bars: pd.DataFrame, target, costs: Costs = DEFAULT_COSTS, session: Session = DEFAULT_SESSION) -> Result:
     target = np.asarray(target, dtype=np.float64)
     if len(target) != len(bars):
         raise ValueError("target must have one value per bar")
@@ -187,7 +191,7 @@ def simulate(bars: pd.DataFrame, target, costs: Costs = Costs(), session: Sessio
     return Result(list(days), pnl, trades, float(lots), float(expo) / max(1, len(bars)))
 
 
-def evaluate(bars: pd.DataFrame, fn, params: dict, costs: Costs = Costs()) -> dict:
+def evaluate(bars: pd.DataFrame, fn, params: dict, costs: Costs = DEFAULT_COSTS) -> dict:
     return simulate(bars, fn(bars, **params), costs).metrics()
 
 

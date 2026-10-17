@@ -23,13 +23,16 @@ def finam_mock(*, token_ok=True, delay=0, readonly=False, accounts=("1899011",),
                                                  "details": []})
             assert json.loads(request.content)["secret"] == "sk_test"
             return httpx.Response(200, json={"token": JWT})
-        assert request.headers.get("Authorization") == JWT
         if path == "/sessions/details":
+            if request.headers.get("Authorization"):  # как настоящий Finam
+                return httpx.Response(400, json={"code": 3, "message": "Token is invalid or malformed"})
+            assert json.loads(request.content)["token"] == JWT
             return httpx.Response(200, json={
                 "created_at": "2026-10-17T08:00:00Z", "expires_at": "2026-10-17T08:15:00Z",
                 "md_permissions": perms if perms is not None else [
                     {"quote_level": "QUOTE_LEVEL_DEPTH_OF_BOOK", "delay_minutes": delay, "mic": "RTSX"}],
                 "account_ids": list(accounts), "readonly": readonly})
+        assert request.headers.get("Authorization") == JWT
         if path == "/assets/clock":
             return httpx.Response(200, json={"timestamp": "2026-10-17T08:00:01Z"})
         if path.startswith("/accounts/"):

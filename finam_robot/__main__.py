@@ -16,7 +16,7 @@ import signal
 from datetime import datetime, time
 
 from . import kernels
-from .config import TZ_MOSCOW, Settings
+from .config import LIVE_CONFIRM_PHRASE, TZ_MOSCOW, Settings
 from .gateway import AssetInfo, FinamAuthError, FinamRestGateway, FinamUnavailableError, PaperBroker, PaperGateway
 from .notify import TelegramNotifier
 from .robot import InstitutionalContestRobot
@@ -30,6 +30,11 @@ logger = logging.getLogger("ContestRobot")
 
 async def build(settings: Settings, gc_monitor: GcMonitor | None = None):
     s = settings
+    if not s.dry_run and s.live_confirm != LIVE_CONFIRM_PHRASE:
+        raise SystemExit(
+            "DRY_RUN=0 отправит реальные заявки на ваш счёт. Чтобы подтвердить, задайте "
+            f"LIVE_TRADING_CONFIRM={LIVE_CONFIRM_PHRASE} в robot.env. Без этого робот не запустится в боевом режиме."
+        )
     md_gateway = None
     if s.book_source in ("rest", "grpc") or not s.dry_run:
         if not s.finam_secret or not s.account_id:
@@ -41,13 +46,21 @@ async def build(settings: Settings, gc_monitor: GcMonitor | None = None):
     if s.dry_run:
         asset = (await md_gateway.get_asset_info(s.symbol) if md_gateway
                  else AssetInfo(tick=s.risk.tick, decimals=3, lot_size=1.0))
+        equity = float(os.getenv("PAPER_EQUITY", "30000"))
+        m_long = m_short = float(os.getenv("PAPER_MARGIN_PER_LOT", "1500"))
+        if md_gateway is not None and "PAPER_EQUITY" not in os.environ:
+            # бумага на реальном счёте: те же эквити и ГО брокера, что будут в бою
+            equity = await md_gateway.get_equity() or equity
+            m_long, m_short = await md_gateway.get_margin_per_lot(s.symbol)
         broker = PaperBroker(
-            equity=float(os.getenv("PAPER_EQUITY", "30000")),
-            margin_per_lot=float(os.getenv("PAPER_MARGIN_PER_LOT", "1500")),
+            equity=equity,
+            margin_per_lot=m_long,
+            margin_short=m_short,
             point_value=float(os.getenv("PAPER_POINT_VALUE", "1000")),
             fee_per_lot=float(os.getenv("PAPER_FEE_PER_LOT", "1.0")),
             latency=float(os.getenv("PAPER_LATENCY", "0.02")),
         )
+        logger.info("Бумажный счёт: эквити %.2f, ГО лонг %.2f / шорт %.2f", equity, m_long, m_short)
 
         async def account_factory():
             return PaperGateway(broker, asset)

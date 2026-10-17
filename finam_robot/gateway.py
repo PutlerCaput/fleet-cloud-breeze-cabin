@@ -178,7 +178,10 @@ class FinamRestGateway:
 
     async def token_details(self) -> dict:
         """Счета, права на маркет-дату и срок действия JWT текущей сессии."""
-        r = await self._http.post("/sessions/details", json={"token": self.jwt})
+        # Finam отвечает 400, если вместе с телом пришёл и заголовок Authorization
+        req = self._http.build_request("POST", "/sessions/details", json={"token": self.jwt})
+        req.headers.pop("Authorization", None)
+        r = await self._http.send(req)
         if r.status_code != 200:
             raise RuntimeError(f"Finam /sessions/details: {finam_error_text(r)}")
         return r.json()
@@ -296,9 +299,10 @@ class PaperBroker:
 
     def __init__(self, equity: float = 30_000.0, margin_per_lot: float = 1_500.0,
                  point_value: float = 1_000.0, fee_per_lot: float = 1.0, latency: float = 0.02,
-                 quote_fn=None) -> None:
+                 quote_fn=None, margin_short: float | None = None) -> None:
         self.cash = equity
         self.margin_per_lot = margin_per_lot
+        self.margin_short = margin_short if margin_short is not None else margin_per_lot
         self.point_value = point_value  # руб. за 1.0 цены на лот (CR: 1000 юаней)
         self.fee_per_lot = fee_per_lot
         self.latency = latency
@@ -375,7 +379,7 @@ class PaperGateway:
         return self.broker.position, self.broker.avg_price
 
     async def get_margin_per_lot(self, symbol: str) -> tuple[float, float]:
-        return self.broker.margin_per_lot, self.broker.margin_per_lot
+        return self.broker.margin_per_lot, self.broker.margin_short
 
     async def execute(self, symbol: str, side: str, qty: int, limit_price: float,
                       client_order_id: str, timeout: float, tif: str = "TIME_IN_FORCE_IOC") -> FillResult:

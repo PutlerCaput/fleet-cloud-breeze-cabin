@@ -113,6 +113,7 @@ class Settings:
     record_books: bool = False                # писать стакан для бэктеста (data_dir/books)
 
     dry_run: bool = True                      # бумажный исполнитель вместо боевого
+    live_confirm: str = ""                    # для DRY_RUN=0 нужно LIVE_CONFIRM_PHRASE
     exec_threaded: bool = False               # True — отдельный поток (см. README: GIL!)
     max_orders_per_sec: float = 5.0
     order_timeout: float = 2.0                # с, ожидание исполнения одной заявки
@@ -158,6 +159,7 @@ class Settings:
             inline_consumer=_env_bool("INLINE_CONSUMER", True),
             record_books=_env_bool("RECORD_BOOKS", False),
             dry_run=_env_bool("DRY_RUN", True),
+            live_confirm=_env("LIVE_TRADING_CONFIRM", ""),
             exec_threaded=_env_bool("EXEC_THREADED", False),
             max_orders_per_sec=_env_float("MAX_ORDERS_PER_SEC", 5.0),
             order_timeout=_env_float("ORDER_TIMEOUT", 2.0),
@@ -181,6 +183,9 @@ class Settings:
             gil_switch_interval=_env_float("GIL_SWITCH_INTERVAL", 0.0005),
             risk=RiskParams.from_env(),
         )
+
+
+LIVE_CONFIRM_PHRASE = "yes-real-money"
 
 
 def risk_to_array(risk: RiskParams) -> np.ndarray:
