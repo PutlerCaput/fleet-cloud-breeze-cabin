@@ -26,6 +26,7 @@ from .config import TZ_MOSCOW, Settings, risk_to_array
 from .execution import ExecReport, ExecutionEngine, OrderIntent
 from .ml import MarketMlOptimizer, load_weights, save_session, save_weights
 from .pipeline import ConflatingConsumer, SnapshotRing
+from .bar_strategy import BarStrategyRunner, FinamBarFeed, load_strategy
 from .recorder import BookRecorder
 from .sources import LEVELS, ROWS_SNAPSHOT
 
@@ -40,7 +41,7 @@ def _sign(x: float) -> int:
 
 class InstitutionalContestRobot:
     def __init__(self, settings: Settings, *, account_factory, source_factory, notifier,
-                 md_gateway=None, gc_monitor=None) -> None:
+                 md_gateway=None, gc_monitor=None, bar_feed_factory=None) -> None:
         self.settings = settings
         self.symbol = settings.symbol
         self.account_factory = account_factory   # async () -> подключённый шлюз счёта
@@ -63,6 +64,19 @@ class InstitutionalContestRobot:
         self.W = K.weights_array(self.ml_weights)
         self._inline = s.inline_consumer
         self._pending_timeout = max(s.pending_timeout, s.exit_retries * (s.order_timeout + 4.0))
+
+        # Режим bars: сделки открывает стратегия на минутных свечах, ядро на
+        # стакане только держит аварийный стоп (без трейлинга и без входов).
+        self.bar_mode = s.strategy == "bars"
+        self.bar_feed_factory = bar_feed_factory
+        self.bar_runner: BarStrategyRunner | None = None
+        self._bar_sig = 0
+        self._bar_since = 0.0
+        self._bar_blocked = False
+        if self.bar_mode:
+            self.P[K.P_HARD_MIN] = self.P[K.P_HARD_MAX] = s.bar_disaster_ticks
+            self.P[K.P_ACT_MULT] = 1e9
+            self.P[K.P_EXIT_ON_REVERSAL] = 0.0
 
         self.is_active = False
         self.position = 0
@@ -170,8 +184,16 @@ class InstitutionalContestRobot:
         if not self._inline:
             self._consumer = ConflatingConsumer(self.ring, self._process)
             self._tasks.append(asyncio.create_task(self._consumer.run(), name="md-consumer"))
+        if self.bar_mode:
+            fn, params = load_strategy(s.bar_strategy)
+            feed = self.bar_feed_factory() if self.bar_feed_factory else FinamBarFeed(self.md_gateway, self.symbol)
+            self.bar_runner = BarStrategyRunner(feed, fn, params, self._on_bar_signal,
+                                                history_days=s.bar_history_days)
+            self._bar_sig, self._bar_blocked = 0, False
+            self._tasks.append(asyncio.create_task(self._bar_loop(), name="bar-strategy"))
         self.notifier.notify(
-            f"🚀 Робот в игре ({self.symbol}). Эквити: {self.start_day_equity:.2f} руб. "
+            f"🚀 Робот в игре ({self.symbol}, {'свечи: ' + s.bar_strategy if self.bar_mode else 'стакан'}). "
+            f"Эквити: {self.start_day_equity:.2f} руб. "
             f"Тик: {self.P[K.P_TICK]:g}. Лотов: {self.lots_long}/{self.lots_short}."
         )
 
@@ -308,7 +330,7 @@ class InstitutionalContestRobot:
     def _process(self, idx: int) -> None:
         ring = self.ring
         act = K.on_tick(ring.books, ring.nbs, ring.nas, ring.tss, idx,
-                        self.P, self.S, self.W, self._allow_entry, self.out, self.rec)
+                        self.P, self.S, self.W, 0 if self.bar_mode else self._allow_entry, self.out, self.rec)
         self.ticks += 1
         if act:
             self._dispatch(act)
@@ -364,6 +386,8 @@ class InstitutionalContestRobot:
         if new_side == 0 and kernel_side != 0:
             ticks = kernel_side * (rep.fill_price - float(S[K.S_ENTRY])) / float(P[K.P_TICK])
             K.on_fill(P, S, 0, float(rep.fill_price), now)
+            if self.bar_mode and not rep.reason.startswith("bars:") and rep.reason not in ("session_end", "daily_loss"):
+                self._bar_blocked = True  # аварийный стоп: повторно не входим до смены сигнала
             self.trades += 1
             self.notifier.notify(f"⏹ Выход ({rep.reason}) по {rep.fill_price:g}: {ticks:+.0f} тик., "
                                  f"{rep.total_ms:.0f} мс")
@@ -377,6 +401,52 @@ class InstitutionalContestRobot:
         else:
             K.on_reject(S)  # IOC не исполнился / частичный выход — ядро решит на следующем тике
         self._check_flat()
+
+    # -------------------------------------------- стратегия на минутных свечах
+    async def _bar_loop(self) -> None:
+        await self.bar_runner.warmup()
+        self._bar_sig = self.bar_runner.state.target
+        self._bar_since = 0.0  # сигнал до старта робота не догоняем
+        if _sign(self.position) != 0 and _sign(self.position) != self._bar_sig:
+            self._bar_reconcile()  # перезапуск с позицией, которой стратегия уже не хочет
+        await self.bar_runner.run_loop()
+
+    def _on_bar_signal(self, sig: int, changed: bool, bar_begin: str) -> None:
+        if changed:
+            self._bar_sig, self._bar_since, self._bar_blocked = sig, time.monotonic(), False
+            logger.info("[BARS] %s сигнал %+d", bar_begin, sig)
+        self._bar_reconcile()
+
+    def _bar_reconcile(self) -> None:
+        """Подогнать позицию под сигнал стратегии, не опережая заявку в пути."""
+        if self._exec is None or not self.is_active or self.S[K.S_PENDING] != 0.0:
+            return
+        sig, cur = self._bar_sig, _sign(self.position)
+        if sig == cur:
+            return
+        bid, ask = self.quote()
+        tick = float(self.P[K.P_TICK])
+        exit_slip = float(self.P[K.P_EXIT_SLIP]) * tick
+        entry_slip = float(self.P[K.P_ENTRY_SLIP]) * tick
+        can_enter = (sig != 0 and self.entries_allowed and not self._bar_blocked
+                     and time.monotonic() - self._bar_since <= self.settings.bar_entry_window_s)
+        if cur != 0 and not can_enter:
+            target, urgent = 0, True
+            limit, ref = ((bid - exit_slip, bid) if cur > 0 else (ask + exit_slip, ask))
+        elif can_enter:
+            lots = self.lots_long if sig > 0 else self.lots_short
+            if lots <= 0:
+                return
+            target, urgent = sig * lots, cur != 0
+            limit, ref = ((ask + entry_slip, ask) if sig > 0 else (bid - entry_slip, bid))
+        else:
+            return
+        if not (bid > 0 and ask > bid):
+            limit = 0.0  # котировок ещё нет — рыночная заявка
+        self.S[K.S_PENDING] = 1.0
+        self._pending_since = time.monotonic()
+        self._exec.submit(OrderIntent(target, limit, ref, f"bars:{'flat' if target == 0 else 'signal'}",
+                                      urgent, time.perf_counter_ns()))
 
     def _check_flat(self) -> None:
         if self._flat_event is None:

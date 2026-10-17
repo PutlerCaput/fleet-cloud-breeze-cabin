@@ -88,6 +88,9 @@ async def build(settings: Settings, gc_monitor: GcMonitor | None = None):
                          f"IteratorBookSource в своём коде (см. README)")
 
     notifier = TelegramNotifier(s.tg_token, s.tg_chat_id)
+    if s.strategy == "bars" and (md_gateway is None or not s.bar_strategy):
+        raise SystemExit("STRATEGY=bars требует BAR_STRATEGY=<путь к strategy.py> и доступ к Finam API "
+                         "(минутные свечи берутся из /instruments/{symbol}/bars)")
     robot = InstitutionalContestRobot(s, account_factory=account_factory, source_factory=source_factory,
                                       notifier=notifier, md_gateway=md_gateway, gc_monitor=gc_monitor)
     if broker is not None:

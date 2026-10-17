@@ -111,6 +111,11 @@ class Settings:
     ring_capacity: int = 256                  # снимков в кольцевом буфере (степень двойки)
     inline_consumer: bool = True              # считать сигнал прямо в продюсере
     record_books: bool = False                # писать стакан для бэктеста (data_dir/books)
+    strategy: str = "obi"                     # obi — ядро на стакане; bars — стратегия на минутных свечах
+    bar_strategy: str = ""                    # путь к strategy.py или module:function
+    bar_history_days: int = 10                # окно истории свечей (>= самый длинный lookback стратегии)
+    bar_disaster_ticks: float = 60.0          # аварийный стоп ядра в режиме bars, тиков
+    bar_entry_window_s: float = 180.0         # сколько секунд после смены сигнала догонять вход
 
     dry_run: bool = True                      # бумажный исполнитель вместо боевого
     live_confirm: str = ""                    # для DRY_RUN=0 нужно LIVE_CONFIRM_PHRASE
@@ -158,6 +163,11 @@ class Settings:
             ring_capacity=_env_int("RING_CAPACITY", 256),
             inline_consumer=_env_bool("INLINE_CONSUMER", True),
             record_books=_env_bool("RECORD_BOOKS", False),
+            strategy=_env("STRATEGY", "obi"),
+            bar_strategy=_env("BAR_STRATEGY", ""),
+            bar_history_days=_env_int("BAR_HISTORY_DAYS", 10),
+            bar_disaster_ticks=_env_float("BAR_DISASTER_TICKS", 60.0),
+            bar_entry_window_s=_env_float("BAR_ENTRY_WINDOW_S", 180.0),
             dry_run=_env_bool("DRY_RUN", True),
             live_confirm=_env("LIVE_TRADING_CONFIRM", ""),
             exec_threaded=_env_bool("EXEC_THREADED", False),
