@@ -11,18 +11,24 @@
     включительно и цене открытия t; high/low/close/оборот дня t нельзя;
   * w_night[t] (держим от закрытия t-1 до открытия t) выставляется в
     аукционе закрытия t-1, когда цена закрытия t-1 ещё не известна, поэтому —
-    по данным до закрытия t-2 и цене открытия t-1; high/low/close/оборот
-    дня t-1 и любые данные дня t нельзя. Обычное «решили вечером — держим
-    несколько дней» выражается так: w_day[t] = W (вход на открытии t),
-    w_night[t+1] = W и далее;
+    по данным до закрытия t-2, цене открытия t-1 и цене pre[t-1] (18:00, за
+    40 минут до аукциона); high/low/close/оборот дня t-1 и любые данные дня t
+    нельзя. Обычное «решили вечером — держим несколько дней» выражается так:
+    w_day[t] = W (вход на открытии t), w_night[t+1] = W и далее;
   * длинные позиции без плеча: сумма долей <= 1; отрицательные доли допустимы
     только в w_day (внутридневной шорт без переноса) при allow_intraday_short;
   * сделки: в аукционе закрытия t-1 переход w_day[t-1] -> w_night[t], на
     открытии t переход w_night[t] -> w_day[t]; издержки cost_side с каждого
     рубля оборота (комиссия + проскальзывание).
 
-Цены корректируются на сплиты и консолидации (доходности), а фильтр «дешевле
-300 ₽» использует фактическую цену торгов того дня (как видел бы трейдер).
+Закрытие — цена аукциона закрытия (LEGALCLOSEPRICE, 18:40–18:50), открытие —
+первая сделка дня (с 2025 г. — аукцион утренней сессии). Ночь включает
+вечернюю сессию t-1 и утреннюю t. Цены корректируются на сплиты и
+консолидации, а фильтр «дешевле 300 ₽» использует фактическую цену того дня.
+Если бумага не торгуется, позиция по ней не меняется (её нельзя закрыть), а
+разрыв цены учитывается на первой сделке после паузы; через 5 дней без торгов
+позиция считается закрытой по последней цене. Свободные деньги могут
+приносить ставку денежного рынка (RUSFAR минус 0,5 % годовых).
 
 Периоды: разработка — до 2023-12-31, валидация — 2024-01-01…2025-06-30,
 отложенная выборка — с 2025-07-01 (её файл исследователям не выдаётся).
@@ -31,6 +37,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -40,6 +47,8 @@ DEV_END = "2023-12-31"
 VAL_START, VAL_END = "2024-01-01", "2025-06-30"
 HOLDOUT_START = "2025-07-01"
 NDFL = 0.13
+CARRY_DAYS = 5          # сколько дней без торгов позиция «висит» до принудительного закрытия
+CASH_FEE = 0.005        # комиссия фонда денежного рынка, годовых
 
 
 @dataclass
@@ -55,17 +64,27 @@ class Data:
     numtrades: pd.DataFrame
     div: pd.DataFrame         # дивиденд на акцию после НДФЛ, на экс-дату (в масштабе скорректированных цен)
     names: dict
+    pre: pd.DataFrame | None = None   # цена в 18:00 (закрытие часовой свечи 17:00), скорректированная
+    cash: pd.Series | None = None     # доходность денежного рынка за отрезок от закрытия t-1 до закрытия t
+
+    def __post_init__(self):
+        if self.pre is None:
+            self.pre = pd.DataFrame(np.nan, index=self.dates, columns=self.secids)
+        if self.cash is None:
+            self.cash = pd.Series(0.0, index=self.dates)
 
     def slice(self, end_date: str) -> Data:
         """Данные строго до end_date (для проверки на заглядывание в будущее)."""
         m = self.dates < end_date
         f = lambda df: df.loc[m]
         return Data(self.dates[m], self.secids, f(self.open), f(self.high), f(self.low), f(self.close),
-                    f(self.raw_close), f(self.value), f(self.numtrades), f(self.div), self.names)
+                    f(self.raw_close), f(self.value), f(self.numtrades), f(self.div), self.names,
+                    f(self.pre), self.cash[m])
 
     # --- доходности отрезков ---
     def night_ret(self) -> pd.DataFrame:
-        prev = self.close.shift(1)
+        """От последнего известного закрытия до открытия t (NaN, если в день t нет сделок)."""
+        prev = self.close.ffill(limit=CARRY_DAYS).shift(1)
         return ((self.open + self.div) / prev - 1.0)
 
     def day_ret(self) -> pd.DataFrame:
@@ -73,12 +92,15 @@ class Data:
 
 
 def load(panel_path: str, splits_path: str, dividends_path: str | None = None,
-         end: str | None = None) -> Data:
+         end: str | None = None, hourly_path: str | None = None, indices_path: str | None = None) -> Data:
     p = pd.read_csv(panel_path)
     if end:
         p = p[p["date"] <= end]
     for c in ("open", "high", "low", "close", "value", "numtrades"):
         p[c] = pd.to_numeric(p[c], errors="coerce")
+    if "legalcloseprice" in p:
+        lc = pd.to_numeric(p["legalcloseprice"], errors="coerce")
+        p["close"] = lc.where(lc > 0, p["close"])
     # дни без сделок — пропуски, а не нули
     bad = (p["value"].fillna(0) <= 0) | (p["close"].fillna(0) <= 0) | (p["open"].fillna(0) <= 0)
     p.loc[bad, ["open", "high", "low", "close"]] = np.nan
@@ -108,8 +130,56 @@ def load(panel_path: str, splits_path: str, dividends_path: str | None = None,
             if s in div.columns and d in div.index:
                 # дивиденд на акцию в масштабе скорректированных цен
                 div.loc[d, s] += float(r["value"]) * (1 - NDFL) * factor.loc[d, s]
+    pre = None
+    if hourly_path:
+        pre = _pre_close(hourly_path, piv["open"] / factor, dates, secids) * factor
+    cash = None
+    if indices_path:
+        cash = _cash_returns(indices_path, dates)
     return Data(dates, secids, piv["open"], piv["high"], piv["low"], piv["close"], raw_close,
-                piv["value"], piv["numtrades"], div, names)
+                piv["value"], piv["numtrades"], div, names, pre, cash)
+
+
+
+def load_dir(d: str, end: str | None = None) -> Data:
+    """Загрузка из каталога с файлами moex_stocks (часовые свечи и индексы — если есть)."""
+    opt = lambda name: os.path.join(d, name) if os.path.exists(os.path.join(d, name)) else None
+    return load(os.path.join(d, "tqbr_daily.csv.gz"), os.path.join(d, "splits.csv"), opt("dividends.csv"),
+                end, hourly_path=opt("tqbr_hourly.csv.gz"), indices_path=opt("indices.csv"))
+
+
+def index_result(indices_path: str, secid: str, start: str, end: str) -> Result:
+    """Индекс как эталон: IMOEX (цена) или MCFTR (полная доходность, до налога)."""
+    ix = pd.read_csv(indices_path)
+    c = ix[ix["secid"] == secid].set_index("date")["close"].astype(float).sort_index()
+    r = c.pct_change().dropna()
+    r = r[(r.index >= start) & (r.index <= end)]
+    z = pd.Series(0.0, index=r.index)
+    return Result(r, z, z + 1.0)
+
+def _pre_close(hourly_path: str, raw_open: pd.DataFrame, dates, secids) -> pd.DataFrame:
+    """Цена в 18:00 по часовым свечам, в фактическом масштабе цен дня.
+    Свечи ISS уже пересчитаны на сплиты, поэтому масштаб берём по открытию:
+    первая свеча дня открывается по той же цене, что и дневная свеча."""
+    h = pd.read_csv(hourly_path)
+    h["date"] = h["begin"].str.slice(0, 10)
+    h["hour"] = h["begin"].str.slice(11, 13).astype(int)
+    first = h.groupby(["date", "secid"])["open"].first().unstack()
+    at18 = h[h["hour"] <= 17].groupby(["date", "secid"])["close"].last().unstack()
+    first = first.reindex(index=dates, columns=secids)
+    at18 = at18.reindex(index=dates, columns=secids)
+    return at18 * (raw_open / first)
+
+
+def _cash_returns(indices_path: str, dates) -> pd.Series:
+    """Доходность денежного рынка от закрытия t-1 до закрытия t: RUSFAR t-1
+    минус комиссия фонда, за календарные дни."""
+    ix = pd.read_csv(indices_path)
+    r = ix[ix["secid"] == "RUSFAR"].set_index("date")["close"].astype(float)
+    r = r.reindex(dates).ffill().bfill()
+    d = pd.to_datetime(pd.Series(dates, index=dates))
+    days = d.diff().dt.days.fillna(1.0)
+    return ((r.shift(1).bfill() / 100 - CASH_FEE).clip(lower=0) * days / 365).rename("cash")
 
 
 def universe(data: Data, max_price: float = 300.0, min_value: float = 30e6, top_liquid: int = 40,
@@ -172,7 +242,8 @@ class Result:
 
 
 def simulate(data: Data, w_night: pd.DataFrame, w_day: pd.DataFrame, cost_side: float = 0.001,
-             allow_intraday_short: bool = False, start: str | None = None, end: str | None = None) -> Result:
+             allow_intraday_short: bool = False, start: str | None = None, end: str | None = None,
+             cash_yield: bool = False) -> Result:
     idx, cols = data.dates, data.secids
     wn = w_night.reindex(index=idx, columns=cols).fillna(0.0)
     wd = w_day.reindex(index=idx, columns=cols).fillna(0.0)
@@ -185,9 +256,7 @@ def simulate(data: Data, w_night: pd.DataFrame, w_day: pd.DataFrame, cost_side: 
             raise ValueError(f"{name}: long exposure above 100% (no leverage)")
     rn = data.night_ret()
     rd = data.day_ret()
-    # нельзя держать бумагу, по которой нет цен на отрезке
-    wn = wn.where(rn.notna(), 0.0)
-    wd = wd.where(rd.notna(), 0.0)
+    wn, wd = _carry(wn, wd, data.close.notna().shift(1, fill_value=False), data.open.notna())
     rn, rd = rn.fillna(0.0), rd.fillna(0.0)
     prev_day = wd.shift(1).fillna(0.0)
     t_close = (wn - prev_day).abs().sum(axis=1)     # аукцион закрытия t-1
@@ -195,6 +264,10 @@ def simulate(data: Data, w_night: pd.DataFrame, w_day: pd.DataFrame, cost_side: 
     r_night = (wn * rn).sum(axis=1) - cost_side * t_close
     r_day = (wd * rd).sum(axis=1) - cost_side * t_open
     daily = (1 + r_night) * (1 + r_day) - 1
+    if cash_yield:
+        # свободная часть капитала (по средней загрузке ночи и дня) — в фонде денежного рынка
+        free = (1 - (wn.clip(lower=0).sum(axis=1) + wd.clip(lower=0).sum(axis=1)) / 2).clip(lower=0)
+        daily = daily + free * data.cash.reindex(idx).fillna(0.0)
     turnover = t_close + t_open
     exposure = (wn.abs().sum(axis=1) + wd.abs().sum(axis=1)) / 2
     m = pd.Series(True, index=idx)
@@ -205,23 +278,54 @@ def simulate(data: Data, w_night: pd.DataFrame, w_day: pd.DataFrame, cost_side: 
     return Result(daily[m], turnover[m], exposure[m])
 
 
-def evaluate(data: Data, fn, params: dict, start: str, end: str, cost_side: float = 0.001,
-             allow_intraday_short: bool = False) -> dict:
-    wn, wd = fn(data, **params)
-    return simulate(data, wn, wd, cost_side, allow_intraday_short, start, end).metrics()
+def _carry(wn: pd.DataFrame, wd: pd.DataFrame, can_close: pd.DataFrame, can_open: pd.DataFrame):
+    """Где сделка невозможна (нет торгов в аукционе закрытия t-1 или на
+    открытии t), позиция остаётся прежней, не дольше CARRY_DAYS дней."""
+    n, k = wn.shape
+    inter = np.empty((2 * n, k))
+    inter[0::2], inter[1::2] = wn.to_numpy(), wd.to_numpy()
+    ok = np.empty((2 * n, k), dtype=bool)
+    ok[0::2], ok[1::2] = can_close.to_numpy(), can_open.to_numpy()
+    w = pd.DataFrame(np.where(ok, inter, np.nan)).ffill(limit=2 * CARRY_DAYS).fillna(0.0).to_numpy()
+    return (pd.DataFrame(w[0::2], index=wn.index, columns=wn.columns),
+            pd.DataFrame(w[1::2], index=wd.index, columns=wd.columns))
 
+
+def evaluate(data: Data, fn, params: dict, start: str, end: str, cost_side: float = 0.001,
+             allow_intraday_short: bool = False, cash_yield: bool = False) -> dict:
+    wn, wd = fn(data, **params)
+    return simulate(data, wn, wd, cost_side, allow_intraday_short, start, end, cash_yield).metrics()
+
+
+
+def lot_check(data: Data, w: pd.DataFrame, lots_path: str, capital: float = 30_000.0) -> dict:
+    """Насколько веса реализуемы целыми лотами на счёте capital: средняя
+    ошибка доли после округления вниз и доля позиций, на которые не хватает
+    даже одного лота. Размеры лотов — текущие (исторические не публикуются)."""
+    lots = pd.read_csv(lots_path).set_index("secid")["lotsize"]
+    lot = lots.reindex(data.secids).fillna(1.0)
+    price = data.raw_close.ffill().shift(1)
+    w = w.reindex(index=data.dates, columns=data.secids).fillna(0.0)
+    lot_rub = price * lot.to_numpy()
+    n = np.floor(w * capital / lot_rub).fillna(0.0)
+    got = n * lot_rub / capital
+    held = w > 1e-9
+    err = (w - got).abs().sum(axis=1)[held.any(axis=1)]
+    return {"mean_weight_shortfall": float(err.mean()) if len(err) else 0.0,
+            "share_positions_below_one_lot": float(((n == 0) & held).sum().sum() / max(1, held.sum().sum())),
+            "median_lot_rub": float(lot_rub.where(held).stack().median()) if held.any().any() else 0.0}
 
 def _perturb_row(data: Data, date: str, fields: tuple[str, ...], seed: int) -> Data:
     rng = np.random.default_rng(seed)
     out = {}
-    for f in ("open", "high", "low", "close", "raw_close", "value", "numtrades"):
+    for f in ("open", "high", "low", "close", "raw_close", "value", "numtrades", "pre"):
         df = getattr(data, f).astype(float)
         if f in fields or (f == "raw_close" and "close" in fields):
             row = df.loc[date]
             df.loc[date] = row * (1 + rng.uniform(0.05, 0.2, len(row)) * rng.choice([-1, 1], len(row)))
         out[f] = df
     return Data(data.dates, data.secids, out["open"], out["high"], out["low"], out["close"], out["raw_close"],
-                out["value"], out["numtrades"], data.div, data.names)
+                out["value"], out["numtrades"], data.div, data.names, out["pre"], data.cash)
 
 
 def _diff_at(a: pd.DataFrame, b: pd.DataFrame, rows, cols) -> pd.Series:
@@ -234,9 +338,10 @@ def _diff_at(a: pd.DataFrame, b: pd.DataFrame, rows, cols) -> pd.Series:
 def lookahead_check(fn, data: Data, params: dict, cuts: int = 4) -> tuple[bool, str]:
     """Две проверки:
     1) усечение: веса на данных до даты X совпадают с весами на полных данных;
-    2) возмущение: high/low/close/оборот дня t не влияют ни на w_night[t],
+    2) возмущение: high/low/close/оборот/pre дня t не влияют ни на w_night[t],
        ни на w_day[t]; open дня t не влияет на w_night[t]; high/low/close/
-       оборот дня t-1 не влияют на w_night[t] (её ставят в аукционе закрытия t-1)."""
+       оборот дня t-1 не влияют на w_night[t] (её ставят в аукционе закрытия
+       t-1; pre[t-1] в 18:00 уже известна)."""
     wn_f, wd_f = fn(data, **params)
     n = len(data.dates)
     for j, k in enumerate(np.linspace(n * 0.3, n * 0.95, cuts).astype(int)):
@@ -251,10 +356,10 @@ def lookahead_check(fn, data: Data, params: dict, cuts: int = 4) -> tuple[bool, 
         upto = data.slice(data.dates[min(k + 1, n - 1)]) if k + 1 < n else data
         t = upto.dates[-1]
         wn0, wd0 = fn(upto, **params)
-        wn1, wd1 = fn(_perturb_row(upto, t, ("high", "low", "close", "value", "numtrades"), j), **params)
+        wn1, wd1 = fn(_perturb_row(upto, t, ("high", "low", "close", "value", "numtrades", "pre"), j), **params)
         for name, a, b in (("w_night", wn0, wn1), ("w_day", wd0, wd1)):
             if len(_diff_at(a, b, [t], data.secids)):
-                return False, f"{name}[{t}] depends on high/low/close/value of the same day"
+                return False, f"{name}[{t}] depends on high/low/close/value/pre of the same day"
         wn2, _ = fn(_perturb_row(upto, t, ("open",), j + 100), **params)
         if len(_diff_at(wn0, wn2, [t], data.secids)):
             return False, f"w_night[{t}] depends on open[{t}] (night position is set at the previous close)"

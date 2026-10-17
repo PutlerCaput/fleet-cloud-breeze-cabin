@@ -6,6 +6,8 @@
   * сплиты/консолидации (/iss/statistics/engines/stock/splits);
   * дивиденды по бумагам (/iss/securities/{secid}/dividends) и дата отсечки
     -> экс-дата с учётом режима расчётов T+2 (до 31.07.2023) и T+1 (после);
+    в октябре 2026 этот адрес отдаёт только описание бумаги — файл тогда
+    пустой, и бэктест считает без дивидендов (занижая доход держателя);
   * текущие размеры лотов;
   * часовые свечи для выбранных бумаг.
 
@@ -70,7 +72,8 @@ def trading_dates(start: str, end: str) -> list[str]:
             s += len(rows)
 
 
-COLS = "TRADEDATE,SECID,SHORTNAME,OPEN,LOW,HIGH,CLOSE,VOLUME,VALUE,NUMTRADES,WAPRICE"
+# LEGALCLOSEPRICE — цена аукциона закрытия; CLOSE — последняя сделка дня, в т.ч. вечерней сессии
+COLS = "TRADEDATE,SECID,SHORTNAME,OPEN,LOW,HIGH,CLOSE,LEGALCLOSEPRICE,VOLUME,VALUE,NUMTRADES,WAPRICE"
 
 
 def _day(args) -> list[list]:
@@ -98,13 +101,32 @@ def _day(args) -> list[list]:
 
 
 def daily_panel(dates: list[str], path: str, workers: int = 4) -> str:
-    cache = os.path.join(os.path.dirname(path), "cache_daily")
+    cache = os.path.join(os.path.dirname(path), "cache_daily_v2")
     os.makedirs(cache, exist_ok=True)
     with ThreadPoolExecutor(workers) as pool:
         parts = list(pool.map(_day, [(d, cache) for d in dates]))
     df = pd.DataFrame([r for p in parts for r in p], columns=COLS.lower().split(","))
     df = df.rename(columns={"tradedate": "date"})
     df.to_csv(path, index=False, compression="gzip")
+    return path
+
+
+def indices(start: str, end: str, path: str, secids=("IMOEX", "MCFTR", "RUSFAR")) -> str:
+    """Индексы для сравнения: IMOEX, MCFTR (полной доходности) и RUSFAR
+    (ставка овернайт-РЕПО, % годовых) как доходность денежного рынка."""
+    rows: list[list] = []
+    for sec in secids:
+        s = 0
+        while True:
+            d = _get(None, f"{ISS}/history/engines/stock/markets/index/securities/{sec}.json",
+                     {"from": start, "till": end, "start": s, "iss.meta": "off", "iss.only": "history",
+                      "history.columns": "TRADEDATE,SECID,OPEN,CLOSE"})
+            chunk = d["history"]["data"]
+            if not chunk:
+                break
+            rows += chunk
+            s += len(chunk)
+    pd.DataFrame(rows, columns=["date", "secid", "open", "close"]).to_csv(path, index=False)
     return path
 
 
@@ -199,6 +221,7 @@ def main() -> None:
     daily_panel(dates, os.path.join(out, "tqbr_daily.csv.gz"))
     print(f"daily panel done {time.time() - t0:.0f}s", flush=True)
     splits(os.path.join(out, "splits.csv"))
+    indices(start, end, os.path.join(out, "indices.csv"))
     lot_sizes(os.path.join(out, "lots.csv"))
     panel = pd.read_csv(os.path.join(out, "tqbr_daily.csv.gz"))
     # кандидаты: когда-либо дешевле 300 ₽ с медианным оборотом от 20 млн ₽/день в каком-либо году
