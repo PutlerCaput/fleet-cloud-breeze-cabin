@@ -78,16 +78,30 @@ class FillResult:
     price: float  # 0.0 — неизвестна; точная цена — через fill_price()
 
 
+class FinamAuthError(RuntimeError):
+    """API-токен не принят (истёк, отозван, скопирован не полностью)."""
+
+
+def finam_error_text(r: httpx.Response) -> str:
+    try:
+        body = r.json()
+        return f"{r.status_code} {body.get('message') or body}"
+    except ValueError:
+        return f"{r.status_code} {r.text[:200]}"
+
+
 class FinamRestGateway:
     """Тонкий клиент Finam Trade API v1 REST поверх одного httpx.AsyncClient."""
 
     def __init__(self, secret: str, account_id: str, *, base_url: str = FINAM_REST_URL,
-                 timeout: float = 3.0, jwt_refresh_every: float = 600.0) -> None:
+                 timeout: float = 3.0, jwt_refresh_every: float = 600.0,
+                 transport: httpx.AsyncBaseTransport | None = None) -> None:
         self._secret = secret
         self.account_id = account_id
         self._http = httpx.AsyncClient(
             base_url=base_url,
-            http2=True,
+            http2=transport is None,
+            transport=transport,
             timeout=httpx.Timeout(timeout, connect=5.0),
             limits=httpx.Limits(max_connections=8, max_keepalive_connections=8, keepalive_expiry=600),
         )
@@ -113,7 +127,8 @@ class FinamRestGateway:
             if not force and time.monotonic() - self._jwt_at < 5.0:
                 return
             r = await self._http.post("/sessions", json={"secret": self._secret})
-            r.raise_for_status()
+            if r.status_code != 200:
+                raise FinamAuthError(f"Finam не принял API-токен: {finam_error_text(r)}")
             self._http.headers["Authorization"] = r.json()["token"]
             self._jwt_at = time.monotonic()
 
@@ -135,7 +150,14 @@ class FinamRestGateway:
             await self._refresh_jwt()
             r = await self._http.request(method, url, **kw)
         if r.status_code != 200:
-            raise RuntimeError(f"Finam {method} {url}: {r.status_code} {r.text[:300]}")
+            raise RuntimeError(f"Finam {method} {url}: {finam_error_text(r)}")
+        return r.json()
+
+    async def token_details(self) -> dict:
+        """Счета, права на маркет-дату и срок действия JWT текущей сессии."""
+        r = await self._http.post("/sessions/details", json={"token": self.jwt})
+        if r.status_code != 200:
+            raise RuntimeError(f"Finam /sessions/details: {finam_error_text(r)}")
         return r.json()
 
     # --- справочные данные ---
@@ -168,9 +190,12 @@ class FinamRestGateway:
                 return int(round(dec(p.get("quantity")))), dec(p.get("average_price"))
         return 0, 0.0
 
+    async def get_asset_params(self, symbol: str) -> dict:
+        return await self._request("GET", f"/assets/{symbol}/params", params={"account_id": self.account_id})
+
     async def get_margin_per_lot(self, symbol: str) -> tuple[float, float]:
         """ГО на лот (лонг, шорт) из /assets/{symbol}/params."""
-        p = await self._request("GET", f"/assets/{symbol}/params", params={"account_id": self.account_id})
+        p = await self.get_asset_params(symbol)
         return money(p.get("long_collateral")), money(p.get("short_collateral"))
 
     # --- заявки ---

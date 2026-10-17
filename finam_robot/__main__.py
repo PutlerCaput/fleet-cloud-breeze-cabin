@@ -17,7 +17,7 @@ from datetime import datetime, time
 
 from . import kernels
 from .config import TZ_MOSCOW, Settings
-from .gateway import AssetInfo, FinamRestGateway, PaperBroker, PaperGateway
+from .gateway import AssetInfo, FinamAuthError, FinamRestGateway, PaperBroker, PaperGateway
 from .notify import TelegramNotifier
 from .robot import InstitutionalContestRobot
 from .runtime import GcMonitor, setup_logging, tune_runtime
@@ -88,7 +88,11 @@ async def main(args) -> None:
     try:
         kernels.warmup(settings.book_depth)
         gc_monitor = GcMonitor()
-        robot, md_gateway = await build(settings, gc_monitor)
+        try:
+            robot, md_gateway = await build(settings, gc_monitor)
+        except FinamAuthError as e:
+            logger.critical("%s. Проверьте токен: python -m finam_robot.check", e)
+            raise SystemExit(2) from None
 
         if args.train:
             await robot.weekly_learning_job()
